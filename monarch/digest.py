@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,16 @@ def _load_latest_error() -> str | None:
         return None
     try:
         return path.read_text(encoding="utf-8").strip()
+    except Exception:
+        return None
+
+
+def _load_latest_error_mtime() -> datetime | None:
+    path = _support_dir() / "latest-error.txt"
+    if not path.exists():
+        return None
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime)
     except Exception:
         return None
 
@@ -242,12 +253,17 @@ async def amain() -> int:
 
     if error_text and latest:
         sched = latest.get("scheduler", {})
-        error_time = ""
-        if Path(_support_dir() / "latest-error.txt").exists():
-            stat = (_support_dir() / "latest-error.txt").stat()
-            import datetime
-            error_time = datetime.datetime.fromtimestamp(stat.st_mtime).isoformat()[:16]
-        if error_time > sched.get("finished_at", "")[:16]:
+        error_mtime = _load_latest_error_mtime()
+        finished_at_dt = None
+        try:
+            finished_at_str = sched.get("finished_at", "")
+            if finished_at_str:
+                finished_at_dt = datetime.fromisoformat(finished_at_str).replace(tzinfo=None)
+        except (ValueError, TypeError):
+            pass
+        if error_mtime is not None and (
+            finished_at_dt is None or error_mtime.timestamp() > finished_at_dt.timestamp()
+        ):
             print(render_error(error_text))
             print("  (Previous successful run shown below)")
             print(render_digest(latest))

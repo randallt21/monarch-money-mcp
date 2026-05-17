@@ -70,6 +70,12 @@ def _find_rule_candidates(
 
         top_id, top_count = counts.most_common(1)[0]
 
+        # Require strict majority: tied top categories are ambiguous — a coin-flip
+        # must not become a permanent rule.
+        most_common_2 = counts.most_common(2)
+        if len(most_common_2) > 1 and most_common_2[1][1] == top_count:
+            continue
+
         # Require at least 3 dominant-category occurrences.
         if top_count < MIN_DOMINANT_COUNT:
             continue
@@ -111,15 +117,19 @@ def _find_rule_candidates(
             }
         )
 
-    # Dedup by (merchant, category_id) — we create unscoped rules so two candidates
-    # for the same merchant+category from different accounts would be redundant.
-    seen: set[tuple[str, str]] = set()
-    deduped: list[dict[str, Any]] = []
+    # Dedup by merchant: if the same merchant maps to more than one dominant category
+    # across accounts, the signal is ambiguous — skip it rather than creating
+    # contradictory unscoped rules that Monarch applies in arbitrary order.
+    by_merchant: dict[str, list[dict[str, Any]]] = {}
     for cand in candidates:
-        key = (cand["merchant"], cand["category_id"])
-        if key not in seen:
-            seen.add(key)
-            deduped.append(cand)
+        by_merchant.setdefault(cand["merchant"], []).append(cand)
+
+    deduped: list[dict[str, Any]] = []
+    for merchant_cands in by_merchant.values():
+        distinct_cats = {c["category_id"] for c in merchant_cands}
+        if len(distinct_cats) == 1:
+            deduped.append(merchant_cands[0])
+        # else: same merchant → two different dominant categories → ambiguous, skip
 
     return deduped
 

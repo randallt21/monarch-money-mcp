@@ -203,5 +203,57 @@ class MaintainStatusTests(unittest.TestCase):
         self.assertAlmostEqual(suggestions[0].confidence, 0.9)
 
 
+class LLMRuleGuardTests(unittest.TestCase):
+    def test_llm_guessed_merchant_produces_no_rule_candidates_without_history(self) -> None:
+        """
+        auto_create_rules receives history_transactions directly from Monarch.
+        An LLM-guessed merchant with no Monarch history never produces a rule candidate,
+        ensuring LLM output cannot reach the persistent rule set.
+        """
+        from monarch.autorules import _find_rule_candidates
+
+        # Represent history as Monarch would return it: "BrandNew" not present at all.
+        history_with_known_merchant = [
+            {
+                "merchant": {"name": "Starbucks"},
+                "account": {"displayName": "Credit"},
+                "category": {"id": "cafe-id", "name": "Coffee Shops"},
+            }
+            for _ in range(3)
+        ]
+        candidates = _find_rule_candidates(history_with_known_merchant, [], {}, set())
+        merchants = [c["merchant"] for c in candidates]
+        self.assertIn("Starbucks", merchants)
+        self.assertNotIn("BrandNew", merchants)
+
+    def test_llm_suggestion_does_not_carry_history_evidence(self) -> None:
+        """
+        An LLM-sourced suggestion has reason='llm_guess' and history_count=0.
+        Only suggestions with history evidence qualify merchant patterns for rules
+        (enforced by auto_create_rules operating on history_transactions, not suggestions).
+        """
+        suggestions = _build_suggestions(
+            [
+                {
+                    "id": "t1",
+                    "date": "2026-05-10",
+                    "merchant": {"name": "MysteryShop"},
+                    "account": {"displayName": "Checking"},
+                    "category": {"name": "Uncategorized"},
+                    "amount": 30,
+                }
+            ],
+            [],
+            min_history=2,
+            min_confidence=0.7,
+            transfer_category_ids=set(),
+            llm_guesses={"MysteryShop": {"category": "Shopping", "confidence": 0.85}},
+            category_name_to_id={"shopping": "shop-id"},
+        )
+        self.assertEqual(len(suggestions), 1)
+        self.assertEqual(suggestions[0].reason, "llm_guess")
+        self.assertEqual(suggestions[0].history_count, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -48,6 +48,7 @@ class Suggestion:
     account: str
     amount: float
     current_category: str
+    current_category_id: str | None
     suggested_category_id: str | None
     suggested_category_name: str | None
     history_count: int
@@ -94,7 +95,7 @@ def _transaction_date(txn: dict[str, Any]) -> date | None:
 
 def _transaction_is_on_or_before(txn: dict[str, Any], cutoff: date) -> bool:
     parsed = _transaction_date(txn)
-    return parsed is None or parsed <= cutoff
+    return parsed is not None and parsed <= cutoff
 
 
 def _split_uncategorized_by_cutoff(
@@ -131,6 +132,7 @@ def _build_suggestions(
         merchant = transaction_merchant_name(txn)
         account = transaction_account_name(txn)
         current_category = transaction_category_name(txn)
+        current_category_id = (txn.get("category") or {}).get("id")
         txn_source = "needs_review" if txn.get("needsReview") else "uncategorized"
         override = match_merchant_override(merchant, account, overrides)
         if override:
@@ -141,6 +143,7 @@ def _build_suggestions(
                 account=account,
                 amount=float(txn.get("amount") or 0),
                 current_category=current_category,
+                current_category_id=current_category_id,
                 suggested_category_id=None,
                 suggested_category_name=override.category,
                 history_count=0,
@@ -174,7 +177,8 @@ def _build_suggestions(
         if counts:
             top_id, top = max(counts.items(), key=lambda entry: int(entry[1]["count"]))
             top_count = int(top["count"])
-            confidence = top_count / len(history)
+            counted_total = sum(int(entry["count"]) for entry in counts.values())
+            confidence = top_count / counted_total
             # Transfer categories are never auto-applied regardless of confidence.
             if top_id in transfer_category_ids:
                 suggestion = Suggestion(
@@ -184,6 +188,7 @@ def _build_suggestions(
                     account=account,
                     amount=float(txn.get("amount") or 0),
                     current_category=current_category,
+                    current_category_id=current_category_id,
                     suggested_category_id=top_id,
                     suggested_category_name=str(top["name"]),
                     history_count=len(history),
@@ -202,6 +207,7 @@ def _build_suggestions(
                     account=account,
                     amount=float(txn.get("amount") or 0),
                     current_category=current_category,
+                    current_category_id=current_category_id,
                     suggested_category_id=top_id,
                     suggested_category_name=str(top["name"]),
                     history_count=len(history),
@@ -230,6 +236,7 @@ def _build_suggestions(
                     account=account,
                     amount=float(txn.get("amount") or 0),
                     current_category=current_category,
+                    current_category_id=current_category_id,
                     suggested_category_id=llm_cat_id,
                     suggested_category_name=llm_cat_name if llm_cat_id else None,
                     history_count=0,
@@ -246,6 +253,7 @@ def _build_suggestions(
                     account=account,
                     amount=float(txn.get("amount") or 0),
                     current_category=current_category,
+                    current_category_id=current_category_id,
                     suggested_category_id=None,
                     suggested_category_name=None,
                     history_count=0,
@@ -430,6 +438,17 @@ async def run_maintain(
                     raise ValueError(
                         f"Could not resolve category id for {row.suggested_category_name!r}"
                     )
+                if row.current_category_id and row.current_category_id == category_id:
+                    applied.append(
+                        {
+                            "transaction_id": row.transaction_id,
+                            "merchant": row.merchant,
+                            "category": row.suggested_category_name,
+                            "source": row.source,
+                            "reason": row.reason,
+                        }
+                    )
+                    continue
                 await mm.update_transaction(
                     transaction_id=row.transaction_id,
                     category_id=category_id,
