@@ -3,8 +3,20 @@
 import os
 from pathlib import Path
 
+import ssl
+
+import aiohttp.connector
+import certifi
 from monarchmoney import MonarchMoney
 from monarchmoney.monarchmoney import MonarchMoneyEndpoints
+
+# aiohttp 3.13+ pre-bakes its SSL context at import time (connector.py:924).
+# On python.org Python 3.13, that context has no CA bundle, causing
+# CERTIFICATE_VERIFY_FAILED against api.monarch.com. Replace the cached
+# context with one that explicitly loads certifi's bundle.
+_ssl_ctx = ssl.create_default_context()
+_ssl_ctx.load_verify_locations(certifi.where())
+aiohttp.connector._SSL_CONTEXT_VERIFIED = _ssl_ctx
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # Session file uses the monarchmoney library's built-in pickle serialization.

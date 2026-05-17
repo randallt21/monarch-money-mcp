@@ -266,6 +266,11 @@ def _log_run_event(
     )
 
 
+def _notify_user(title: str, message: str) -> None:
+    script = f'display notification {json.dumps(message[:240])} with title {json.dumps(title[:80])}'
+    subprocess.run(["osascript", "-e", script], check=False, capture_output=True, text=True)
+
+
 def _describe_exception(exc: BaseException) -> str:
     detail = str(exc).strip()
     return f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
@@ -425,6 +430,19 @@ async def _run_job(
                 run_path=run_json_path,
                 output=sys.stdout,
             )
+            auto_applied = (summary or {}).get("auto_applied", 0)
+            rules_created = (summary or {}).get("rules_created", 0)
+            needs_review = (summary or {}).get("needs_review", 0)
+            parts: list[str] = []
+            if auto_applied:
+                parts.append(f"{auto_applied} sorted")
+            if rules_created:
+                parts.append(f"{rules_created} rule{'s' if rules_created != 1 else ''} created")
+            if needs_review:
+                parts.append(f"{needs_review} needs you")
+            notify_body = ", ".join(parts) if parts else "All clear"
+            if not dry_run:
+                _notify_user("Monarch", notify_body)
             return 0
         except Exception:
             finished_at = _now()
@@ -449,6 +467,7 @@ async def _run_job(
                 output=sys.stderr,
             )
             print(error_text, file=sys.stderr, end="")
+            _notify_user("Monarch: run failed", "Daily maintenance failed — check the scheduler log.")
             return 1
 
 
