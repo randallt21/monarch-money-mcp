@@ -9,12 +9,12 @@ __pycache__/
 .venv/
 venv/
 
-# uv
-.venv/
-
 # Session files
 .monarchmoney_session
 .mm/
+
+# Logs
+*.log
 
 # IDE
 .vscode/

@@ -4,9 +4,9 @@
 import os
 import asyncio
 import json
+import sys
 from typing import Any, Dict, Optional, List
 from datetime import datetime, date
-from pathlib import Path
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -14,6 +14,8 @@ from mcp.server.models import InitializationOptions
 from mcp.types import ServerCapabilities
 from mcp.types import Tool, TextContent
 from monarchmoney import MonarchMoney
+
+from monarch.client import get_client
 
 
 def convert_dates_to_strings(obj: Any) -> Any:
@@ -40,42 +42,25 @@ server = Server("monarch-money")
 
 # Global variable to store the MonarchMoney client
 mm_client: Optional[MonarchMoney] = None
-session_file = Path.home() / ".monarchmoney_session"
+
+
+def _interactive_stdio_detected() -> bool:
+    return sys.stdin.isatty() or sys.stdout.isatty()
+
+
+def _allow_interactive_stdio() -> bool:
+    return os.environ.get("MONARCH_ALLOW_INTERACTIVE_SERVER", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
 
 
 async def initialize_client():
-    """Initialize the MonarchMoney client with authentication."""
+    """Initialize the shared MonarchMoney client."""
     global mm_client
-    
-    email = os.getenv("MONARCH_EMAIL")
-    password = os.getenv("MONARCH_PASSWORD")
-    mfa_secret = os.getenv("MONARCH_MFA_SECRET")
-    
-    if not email or not password:
-        raise ValueError("MONARCH_EMAIL and MONARCH_PASSWORD environment variables are required")
-    
-    mm_client = MonarchMoney()
-    
-    # Try to load existing session first
-    if session_file.exists() and not os.getenv("MONARCH_FORCE_LOGIN"):
-        try:
-            mm_client.load_session(str(session_file))
-            # Test if session is still valid
-            await mm_client.get_accounts()
-            print("Loaded existing session successfully")
-            return
-        except Exception:
-            print("Existing session invalid, logging in fresh")
-    
-    # Login with credentials
-    if mfa_secret:
-        await mm_client.login(email, password, mfa_secret_key=mfa_secret)
-    else:
-        await mm_client.login(email, password)
-    
-    # Save session for future use
-    mm_client.save_session(str(session_file))
-    print("Logged in and saved session")
+    mm_client = await get_client()
+    print("Monarch client initialized")
 
 
 # Tool definitions
@@ -123,6 +108,10 @@ async def list_tools() -> List[Tool]:
                     "category_id": {
                         "type": "string",
                         "description": "Filter by specific category ID"
+                    },
+                    "search": {
+                        "type": "string",
+                        "description": "Optional text search filter"
                     }
                 },
                 "additionalProperties": False
@@ -183,9 +172,9 @@ async def list_tools() -> List[Tool]:
                         "type": "number",
                         "description": "Transaction amount (negative for expenses)"
                     },
-                    "description": {
+                    "merchant_name": {
                         "type": "string",
-                        "description": "Transaction description"
+                        "description": "Merchant or payee name"
                     },
                     "category_id": {
                         "type": "string",
@@ -204,7 +193,7 @@ async def list_tools() -> List[Tool]:
                         "description": "Optional notes for the transaction"
                     }
                 },
-                "required": ["amount", "description", "account_id", "date"],
+                "required": ["amount", "merchant_name", "category_id", "account_id", "date"],
                 "additionalProperties": False
             }
         ),
@@ -226,6 +215,10 @@ async def list_tools() -> List[Tool]:
                         "type": "string",
                         "description": "New transaction description"
                     },
+                    "merchant_name": {
+                        "type": "string",
+                        "description": "New merchant name"
+                    },
                     "category_id": {
                         "type": "string",
                         "description": "New category ID"
@@ -237,6 +230,14 @@ async def list_tools() -> List[Tool]:
                     "notes": {
                         "type": "string",
                         "description": "New notes for the transaction"
+                    },
+                    "needs_review": {
+                        "type": "boolean",
+                        "description": "Set or clear review status"
+                    },
+                    "hide_from_reports": {
+                        "type": "boolean",
+                        "description": "Hide or unhide the transaction from reports"
                     }
                 },
                 "required": ["transaction_id"],
@@ -245,10 +246,16 @@ async def list_tools() -> List[Tool]:
         ),
         Tool(
             name="refresh_accounts",
-            description="Request a refresh of all account data from financial institutions",
+            description="Request a refresh of account data from financial institutions",
             inputSchema={
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "account_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional account IDs to refresh. Defaults to all active accounts."
+                    }
+                },
                 "additionalProperties": False
             }
         )
@@ -272,13 +279,17 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
             # Build filter parameters
             filters = {}
             if "start_date" in arguments:
-                filters["start_date"] = datetime.strptime(arguments["start_date"], "%Y-%m-%d").date()
+                datetime.strptime(arguments["start_date"], "%Y-%m-%d")
+                filters["start_date"] = arguments["start_date"]
             if "end_date" in arguments:
-                filters["end_date"] = datetime.strptime(arguments["end_date"], "%Y-%m-%d").date()
+                datetime.strptime(arguments["end_date"], "%Y-%m-%d")
+                filters["end_date"] = arguments["end_date"]
             if "account_id" in arguments:
-                filters["account_id"] = arguments["account_id"]
+                filters["account_ids"] = [arguments["account_id"]]
             if "category_id" in arguments:
-                filters["category_id"] = arguments["category_id"]
+                filters["category_ids"] = [arguments["category_id"]]
+            if "search" in arguments:
+                filters["search"] = arguments["search"]
             
             transactions = await mm_client.get_transactions(
                 limit=arguments.get("limit", 100),
@@ -292,9 +303,11 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
         elif name == "get_budgets":
             kwargs = {}
             if "start_date" in arguments:
-                kwargs["start_date"] = datetime.strptime(arguments["start_date"], "%Y-%m-%d").date()
+                datetime.strptime(arguments["start_date"], "%Y-%m-%d")
+                kwargs["start_date"] = arguments["start_date"]
             if "end_date" in arguments:
-                kwargs["end_date"] = datetime.strptime(arguments["end_date"], "%Y-%m-%d").date()
+                datetime.strptime(arguments["end_date"], "%Y-%m-%d")
+                kwargs["end_date"] = arguments["end_date"]
             
             try:
                 budgets = await mm_client.get_budgets(**kwargs)
@@ -315,9 +328,11 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
         elif name == "get_cashflow":
             kwargs = {}
             if "start_date" in arguments:
-                kwargs["start_date"] = datetime.strptime(arguments["start_date"], "%Y-%m-%d").date()
+                datetime.strptime(arguments["start_date"], "%Y-%m-%d")
+                kwargs["start_date"] = arguments["start_date"]
             if "end_date" in arguments:
-                kwargs["end_date"] = datetime.strptime(arguments["end_date"], "%Y-%m-%d").date()
+                datetime.strptime(arguments["end_date"], "%Y-%m-%d")
+                kwargs["end_date"] = arguments["end_date"]
             
             cashflow = await mm_client.get_cashflow(**kwargs)
             # Convert date objects to strings before serialization
@@ -331,15 +346,14 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
             return [TextContent(type="text", text=json.dumps(categories, indent=2))]
         
         elif name == "create_transaction":
-            # Convert date string to date object
-            transaction_date = datetime.strptime(arguments["date"], "%Y-%m-%d").date()
+            datetime.strptime(arguments["date"], "%Y-%m-%d")
             
             result = await mm_client.create_transaction(
                 amount=arguments["amount"],
-                description=arguments["description"],
-                category_id=arguments.get("category_id"),
+                merchant_name=arguments["merchant_name"],
+                category_id=arguments["category_id"],
                 account_id=arguments["account_id"],
-                date=transaction_date,
+                date=arguments["date"],
                 notes=arguments.get("notes")
             )
             # Convert date objects to strings before serialization
@@ -352,13 +366,20 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
             if "amount" in arguments:
                 updates["amount"] = arguments["amount"]
             if "description" in arguments:
-                updates["description"] = arguments["description"]
+                updates["merchant_name"] = arguments["description"]
+            if "merchant_name" in arguments:
+                updates["merchant_name"] = arguments["merchant_name"]
             if "category_id" in arguments:
                 updates["category_id"] = arguments["category_id"]
             if "date" in arguments:
-                updates["date"] = datetime.strptime(arguments["date"], "%Y-%m-%d").date()
+                datetime.strptime(arguments["date"], "%Y-%m-%d")
+                updates["date"] = arguments["date"]
             if "notes" in arguments:
                 updates["notes"] = arguments["notes"]
+            if "needs_review" in arguments:
+                updates["needs_review"] = arguments["needs_review"]
+            if "hide_from_reports" in arguments:
+                updates["hide_from_reports"] = arguments["hide_from_reports"]
             
             result = await mm_client.update_transaction(**updates)
             # Convert date objects to strings before serialization
@@ -366,7 +387,18 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
             return [TextContent(type="text", text=json.dumps(result, indent=2))]
         
         elif name == "refresh_accounts":
-            result = await mm_client.request_accounts_refresh()
+            account_ids = arguments.get("account_ids")
+            if not account_ids:
+                accounts = await mm_client.get_accounts()
+                account_ids = [
+                    acct["id"]
+                    for acct in accounts.get("accounts", [])
+                    if acct.get("isActive", True)
+                ]
+            result = {
+                "success": await mm_client.request_accounts_refresh(account_ids),
+                "account_ids": account_ids,
+            }
             # Convert date objects to strings before serialization
             result = convert_dates_to_strings(result)
             return [TextContent(type="text", text=json.dumps(result, indent=2))]
@@ -380,12 +412,21 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
 
 async def main():
     """Main entry point for the server."""
+    if _interactive_stdio_detected() and not _allow_interactive_stdio():
+        print(
+            "Refusing to start Monarch MCP server in an interactive terminal. "
+            "Configure it in your MCP client so it is spawned over stdio pipes, "
+            "or set MONARCH_ALLOW_INTERACTIVE_SERVER=1 to override.",
+            file=sys.stderr,
+        )
+        return 2
+
     # Initialize the MonarchMoney client
     try:
         await initialize_client()
     except Exception as e:
         print(f"Failed to initialize MonarchMoney client: {e}")
-        return
+        return 1
     
     # Run the MCP server
     async with stdio_server() as (read_stream, write_stream):
@@ -400,7 +441,8 @@ async def main():
                 )
             )
         )
+    return 0
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    raise SystemExit(asyncio.run(main()))

@@ -1,0 +1,9 @@
+{
+  "merchant_overrides": [
+    {
+      "merchant": "Gorumpl Com Rumpl",
+      "category": "Gifts",
+      "notes": "Gift for a friend. Keep this as a repo-side policy override instead of a broad Monarch merchant rule."
+    }
+  ]
+}

@@ -50,6 +50,9 @@ Add the server to your `.mcp.json` configuration file:
 - Replace `/path/to/uv` with the full path to your `uv` executable (find it with `which uv`)
 - Replace `/path/to/monarch-money-mcp` with the absolute path to this server directory
 - Use absolute paths, not relative paths
+- Do not keep `server.py` running manually in an interactive terminal. This MCP server is stdio-only and should be spawned by your MCP client over pipes.
+- Interactive launches now refuse to start by default to avoid duplicate long-lived Python processes and EDR false positives.
+- If you intentionally need a one-off manual launch for debugging, set `MONARCH_ALLOW_INTERACTIVE_SERVER=1`.
 
 ### Getting Your MFA Secret
 
@@ -101,6 +104,56 @@ Use the get_accounts tool to see all my accounts and their current balances.
 Get all transactions from January 2024 using get_transactions with start_date "2024-01-01" and end_date "2024-01-31".
 ```
 
+### Rule Candidate Analysis
+```
+Use the CLI: uv run python -m monarch.sync rule-candidates --months 6
+```
+
+### Review Resolution
+```
+Use the CLI: uv run python -m monarch.update resolve-review
+Use the CLI: uv run python -m monarch.update bulk-categorize OpenAI "AI & Infra" --months 18 --exact --negative-only --yes
+```
+
+### Daily Dashboard
+```
+Use the CLI: uv run python -m monarch.sync dashboard
+```
+
+### Scheduled Maintenance
+```
+Use the CLI: uv run python -m monarch.maintain --dry-run
+Use the CLI: uv run python -m monarch.maintain --refresh
+Use the CLI: uv run python -m monarch.maintain --json
+Use the CLI: uv run python -m monarch.scheduler install-launchd --hour 9 --minute 0
+Use the CLI: uv run python -m monarch.scheduler status
+Use the CLI: uv run python -m monarch.scheduler run-job --dry-run
+Use the CLI: uv run python -m monarch.scheduler uninstall-launchd
+Use the CLI: uv run python -m monarch.codex_audit run-agent
+Use the CLI: uv run python -m monarch.codex_audit install-launchd --weekday 1 --hour 12 --minute 0
+Use the CLI: uv run python -m monarch.codex_audit status
+Use the CLI: uv run python -m monarch.codex_audit uninstall-launchd
+```
+
+### Repo Policy Overrides
+```
+Edit monarch-policies.json to encode merchant exceptions that should not become broad Monarch rules.
+Example: a one-off merchant gift purchase can map to Gifts in the scheduler without creating a permanent in-app merchant rule.
+```
+
+### Rule Management
+```
+Use the CLI: uv run python -m monarch.rules list
+Use the CLI: uv run python -m monarch.rules preview --merchant "Target" --category Shopping
+Use the CLI: uv run python -m monarch.rules update RULE_ID --category Shopping --dry-run
+```
+
+### Category Management
+```
+Use the CLI: uv run python -m monarch.categories list --group Business
+Use the CLI: uv run python -m monarch.categories create --group Business --name "AI & Infra" --icon "🤖" --budget 250 --future
+```
+
 ### Budget Tracking
 ```
 Show me my current budget status using the get_budgets tool.
@@ -123,14 +176,37 @@ The server automatically manages authentication sessions:
 ### Connection Issues
 - Verify your email and password are correct in `.mcp.json`
 - Check your internet connection
-- Try running the server directly to see detailed error messages:
+- If you need a one-off manual debug launch, explicitly allow it:
   ```bash
-  uv run server.py
+  MONARCH_ALLOW_INTERACTIVE_SERVER=1 uv run server.py
   ```
 
 ### Session Problems
 - Delete the `.mm` directory to clear cached sessions
 - Set `MONARCH_FORCE_LOGIN=true` in your `.mcp.json` env section temporarily
+
+### launchd Automation
+- The local scheduler writes summaries to `~/Library/Application Support/monarch-money-mcp/maintain/`
+- The latest human-readable successful summary is `~/Library/Application Support/monarch-money-mcp/maintain/latest-summary.txt`
+- The latest machine-readable successful summary is `~/Library/Application Support/monarch-money-mcp/maintain/latest-summary.json`
+- The latest failure artifacts are `~/Library/Application Support/monarch-money-mcp/maintain/latest-error.txt` and `latest-error.json`
+- stdout and stderr logs live in `~/Library/Logs/monarch-money-mcp/`
+- Both automation surfaces prune old run artifacts and trim logs so they do not grow without bound
+- Install the LaunchAgent with:
+  ```bash
+  uv run python -m monarch.scheduler install-launchd --hour 9 --minute 0
+  ```
+
+### Codex Audit Automation
+- The weekly engineering agent writes artifacts to `~/Library/Application Support/monarch-money-mcp/codex-audit/`
+- It is allowed to improve repo code, but not to mutate live Monarch data
+- Its structured prompt lives in `automation/codex-audit-prompt.md`
+- Its output contract lives in `automation/codex-audit-output.schema.json`
+- Install it for Monday noon with:
+  ```bash
+  uv run python -m monarch.codex_audit install-launchd --weekday 1 --hour 12 --minute 0
+  ```
+- `status` now reports an explicit health line so stale or failing automation is easier to spot
 
 ## Credits
 
