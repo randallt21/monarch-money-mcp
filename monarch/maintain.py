@@ -18,6 +18,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime
 from typing import Any
 
+from monarch.autorules import auto_create_rules
 from monarch.budgets import budget_month_summary, budget_watchlist
 from monarch.classify import classify_merchants
 from monarch.client import get_client
@@ -317,6 +318,7 @@ async def run_maintain(
     min_confidence: float,
     refresh: bool,
     dry_run: bool,
+    create_rules: bool = True,
 ) -> dict[str, Any]:
     today = date.today()
     phase_timings: dict[str, float] = {}
@@ -491,6 +493,18 @@ async def run_maintain(
     rules = await fetch_rules()
     phase_timings["fetch_rules"] = round((_utc_now() - phase_started).total_seconds(), 3)
 
+    phase_started = _utc_now()
+    new_rules: list[dict[str, Any]] = []
+    if create_rules:
+        new_rules = await auto_create_rules(
+            history_transactions,
+            rules,
+            category_lookup,
+            transfer_category_ids,
+            dry_run=dry_run,
+        )
+    phase_timings["auto_create_rules"] = round((_utc_now() - phase_started).total_seconds(), 3)
+
     llm_applied_count = sum(
         1 for row in applied if row.get("reason") == "llm_guess"
     )
@@ -510,7 +524,8 @@ async def run_maintain(
         "applied": applied,
         "auto_applied": len(applied),
         "llm_applied": llm_applied_count,
-        "rules_created": 0,
+        "rules_created": sum(1 for r in new_rules if r.get("created")),
+        "new_rules": new_rules,
         "needs_review": len(remaining_review),
         "failures": failures,
         "remaining_review_count": len(remaining_review),
@@ -558,7 +573,16 @@ def format_summary(summary: dict[str, Any], *, color: bool = True) -> str:
         lines.append(f"  {_style(label, CYAN, color=color)}")
     else:
         for row in summary["applied"][:10]:
-            lines.append(f"  {row['merchant']} -> {row['category']} [{row['source']}]")
+            tag = " [llm guess]" if row.get("reason") == "llm_guess" else ""
+            lines.append(f"  {row['merchant']} -> {row['category']} [{row['source']}]{tag}")
+
+    new_rules = summary.get("new_rules", [])
+    if new_rules:
+        lines.append("")
+        lines.append(_style("Rules Created", BOLD, color=color))
+        for rule in new_rules[:10]:
+            status = "dry run" if rule.get("dry_run") else ("created" if rule.get("created") else f"failed: {rule.get('error','?')}")
+            lines.append(f"  {rule['merchant']} -> {rule['category_name']} [{status}]")
 
     if summary["failures"]:
         lines.append("")
@@ -671,6 +695,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Scan all history (60 months) for uncategorized transactions — run once to catch up",
     )
     parser.add_argument(
+        "--no-create-rules",
+        action="store_true",
+        help="Skip automatic rule creation from history patterns",
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="Emit the final summary as JSON",
@@ -692,6 +721,7 @@ async def amain(argv: list[str] | None = None) -> int:
             min_confidence=args.min_confidence,
             refresh=args.refresh,
             dry_run=args.dry_run,
+            create_rules=not args.no_create_rules,
         )
     except KeyboardInterrupt:
         return 130
