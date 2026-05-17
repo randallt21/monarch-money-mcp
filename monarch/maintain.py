@@ -19,6 +19,7 @@ from datetime import UTC, date, datetime
 from typing import Any
 
 from monarch.budgets import budget_month_summary, budget_watchlist
+from monarch.classify import classify_merchants
 from monarch.client import get_client
 from monarch.policies import load_merchant_overrides, match_merchant_override
 from monarch.rules import fetch_rules
@@ -118,6 +119,9 @@ def _build_suggestions(
     *,
     min_history: int,
     min_confidence: float,
+    transfer_category_ids: set[str],
+    llm_guesses: dict[str, dict[str, Any]],
+    category_name_to_id: dict[str, str],
 ) -> list[Suggestion]:
     suggestions: list[Suggestion] = []
     overrides = load_merchant_overrides()
@@ -126,6 +130,7 @@ def _build_suggestions(
         merchant = transaction_merchant_name(txn)
         account = transaction_account_name(txn)
         current_category = transaction_category_name(txn)
+        txn_source = "needs_review" if txn.get("needsReview") else "uncategorized"
         override = match_merchant_override(merchant, account, overrides)
         if override:
             suggestion = Suggestion(
@@ -141,7 +146,7 @@ def _build_suggestions(
                 confidence=1.0,
                 safe=True,
                 reason="policy_override",
-                source="needs_review" if txn.get("needsReview") else "uncategorized",
+                source=txn_source,
             )
             suggestions.append(suggestion)
             continue
@@ -169,45 +174,85 @@ def _build_suggestions(
             top_id, top = max(counts.items(), key=lambda entry: int(entry[1]["count"]))
             top_count = int(top["count"])
             confidence = top_count / len(history)
-            safe = len(history) >= min_history and confidence >= min_confidence
-            suggestion = Suggestion(
-                transaction_id=str(txn.get("id") or ""),
-                date=str(txn.get("date") or "")[:10],
-                merchant=merchant,
-                account=account,
-                amount=float(txn.get("amount") or 0),
-                current_category=current_category,
-                suggested_category_id=top_id,
-                suggested_category_name=str(top["name"]),
-                history_count=len(history),
-                confidence=confidence,
-                safe=safe,
-                reason="matched_history"
-                if safe
-                else _unsafe_history_reason(
+            # Transfer categories are never auto-applied regardless of confidence.
+            if top_id in transfer_category_ids:
+                suggestion = Suggestion(
+                    transaction_id=str(txn.get("id") or ""),
+                    date=str(txn.get("date") or "")[:10],
+                    merchant=merchant,
+                    account=account,
+                    amount=float(txn.get("amount") or 0),
+                    current_category=current_category,
+                    suggested_category_id=top_id,
+                    suggested_category_name=str(top["name"]),
                     history_count=len(history),
                     confidence=confidence,
-                    min_history=min_history,
-                    min_confidence=min_confidence,
-                ),
-                source="needs_review" if txn.get("needsReview") else "uncategorized",
-            )
+                    safe=False,
+                    reason="transfer_excluded",
+                    source=txn_source,
+                )
+            else:
+                # Aggressive gate: history ≥ min OR confidence ≥ min (not both required).
+                safe = len(history) >= min_history or confidence >= min_confidence
+                suggestion = Suggestion(
+                    transaction_id=str(txn.get("id") or ""),
+                    date=str(txn.get("date") or "")[:10],
+                    merchant=merchant,
+                    account=account,
+                    amount=float(txn.get("amount") or 0),
+                    current_category=current_category,
+                    suggested_category_id=top_id,
+                    suggested_category_name=str(top["name"]),
+                    history_count=len(history),
+                    confidence=confidence,
+                    safe=safe,
+                    reason="matched_history"
+                    if safe
+                    else _unsafe_history_reason(
+                        history_count=len(history),
+                        confidence=confidence,
+                        min_history=min_history,
+                        min_confidence=min_confidence,
+                    ),
+                    source=txn_source,
+                )
         else:
-            suggestion = Suggestion(
-                transaction_id=str(txn.get("id") or ""),
-                date=str(txn.get("date") or "")[:10],
-                merchant=merchant,
-                account=account,
-                amount=float(txn.get("amount") or 0),
-                current_category=current_category,
-                suggested_category_id=None,
-                suggested_category_name=None,
-                history_count=0,
-                confidence=0.0,
-                safe=False,
-                reason="no_history",
-                source="needs_review" if txn.get("needsReview") else "uncategorized",
-            )
+            # No history: try LLM classifier (subscription-based, not API-key).
+            llm = llm_guesses.get(merchant)
+            if llm:
+                llm_cat_name = str(llm.get("category") or "")
+                llm_cat_id = category_name_to_id.get(llm_cat_name.casefold())
+                suggestion = Suggestion(
+                    transaction_id=str(txn.get("id") or ""),
+                    date=str(txn.get("date") or "")[:10],
+                    merchant=merchant,
+                    account=account,
+                    amount=float(txn.get("amount") or 0),
+                    current_category=current_category,
+                    suggested_category_id=llm_cat_id,
+                    suggested_category_name=llm_cat_name if llm_cat_id else None,
+                    history_count=0,
+                    confidence=float(llm.get("confidence") or 0),
+                    safe=bool(llm_cat_id),
+                    reason="llm_guess",
+                    source=txn_source,
+                )
+            else:
+                suggestion = Suggestion(
+                    transaction_id=str(txn.get("id") or ""),
+                    date=str(txn.get("date") or "")[:10],
+                    merchant=merchant,
+                    account=account,
+                    amount=float(txn.get("amount") or 0),
+                    current_category=current_category,
+                    suggested_category_id=None,
+                    suggested_category_name=None,
+                    history_count=0,
+                    confidence=0.0,
+                    safe=False,
+                    reason="no_history",
+                    source=txn_source,
+                )
         suggestions.append(suggestion)
 
     suggestions.sort(
@@ -316,10 +361,17 @@ async def run_maintain(
     )
 
     phase_started = _utc_now()
+    raw_categories = (await mm.get_transaction_categories()).get("categories", [])
     category_lookup = {
-        str(category.get("id") or ""): str(category.get("name") or "")
-        for category in (await mm.get_transaction_categories()).get("categories", [])
-        if category.get("id") and category.get("name")
+        str(cat.get("id") or ""): str(cat.get("name") or "")
+        for cat in raw_categories
+        if cat.get("id") and cat.get("name")
+    }
+    # Categories whose group type is "transfer" must never be auto-applied.
+    transfer_category_ids: set[str] = {
+        str(cat.get("id") or "")
+        for cat in raw_categories
+        if (cat.get("group") or {}).get("type") == "transfer"
     }
     phase_timings["fetch_categories"] = round(
         (_utc_now() - phase_started).total_seconds(), 3
@@ -327,6 +379,11 @@ async def run_maintain(
     category_name_to_id = {
         name.casefold(): category_id for category_id, name in category_lookup.items()
     }
+    # Non-transfer category names for the LLM schema enum.
+    non_transfer_category_names = [
+        name for cat_id, name in category_lookup.items()
+        if cat_id not in transfer_category_ids and name
+    ]
 
     target_transactions = [
         txn
@@ -335,11 +392,25 @@ async def run_maintain(
         and (txn.get("needsReview") or transaction_category_name(txn) == "Uncategorized")
     ]
 
+    # Pre-classify unknown merchants via local claude CLI (batched, one call).
+    phase_started = _utc_now()
+    no_history_merchants = list({
+        transaction_merchant_name(txn)
+        for txn in target_transactions
+    })
+    llm_guesses = classify_merchants(no_history_merchants, non_transfer_category_names)
+    phase_timings["classify_merchants"] = round(
+        (_utc_now() - phase_started).total_seconds(), 3
+    )
+
     suggestions = _build_suggestions(
         target_transactions,
         history_transactions,
         min_history=min_history,
         min_confidence=min_confidence,
+        transfer_category_ids=transfer_category_ids,
+        llm_guesses=llm_guesses,
+        category_name_to_id=category_name_to_id,
     )
     safe_suggestions = [row for row in suggestions if row.safe]
     manual_suggestions = [row for row in suggestions if not row.safe]
@@ -368,6 +439,7 @@ async def run_maintain(
                         "merchant": row.merchant,
                         "category": row.suggested_category_name,
                         "source": row.source,
+                        "reason": row.reason,
                     }
                 )
             except Exception as exc:
@@ -419,6 +491,9 @@ async def run_maintain(
     rules = await fetch_rules()
     phase_timings["fetch_rules"] = round((_utc_now() - phase_started).total_seconds(), 3)
 
+    llm_applied_count = sum(
+        1 for row in applied if row.get("reason") == "llm_guess"
+    )
     return {
         "month": month,
         "refresh": refresh_info,
@@ -433,6 +508,10 @@ async def run_maintain(
         "safe_suggestions": [asdict(row) for row in safe_suggestions],
         "manual_suggestions": [asdict(row) for row in manual_suggestions],
         "applied": applied,
+        "auto_applied": len(applied),
+        "llm_applied": llm_applied_count,
+        "rules_created": 0,
+        "needs_review": len(remaining_review),
         "failures": failures,
         "remaining_review_count": len(remaining_review),
         "remaining_uncategorized_count": len(remaining_uncategorized),
@@ -440,6 +519,7 @@ async def run_maintain(
         "budget_summary": budget_summary,
         "budget_watch": budget_watch[:8],
         "rule_count": len(rules),
+        "llm_guesses_count": len(llm_guesses),
         "phase_timings_seconds": phase_timings,
     }
 
@@ -566,14 +646,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--min-history",
         type=int,
-        default=3,
-        help="Minimum categorized history before auto-applying (default: 3)",
+        default=2,
+        help="Minimum history observations for auto-apply via history gate (default: 2)",
     )
     parser.add_argument(
         "--min-confidence",
         type=float,
-        default=0.8,
-        help="Confidence threshold between 0 and 1 (default: 0.8)",
+        default=0.7,
+        help="Confidence threshold for auto-apply via confidence gate (default: 0.7)",
     )
     parser.add_argument(
         "--refresh",
@@ -584,6 +664,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Do not apply safe fixes",
+    )
+    parser.add_argument(
+        "--backlog",
+        action="store_true",
+        help="Scan all history (60 months) for uncategorized transactions — run once to catch up",
     )
     parser.add_argument(
         "--json",
@@ -597,10 +682,11 @@ async def amain(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    lookback = 60 if args.backlog else args.lookback_months
     try:
         summary = await run_maintain(
             month=args.month,
-            lookback_months=args.lookback_months,
+            lookback_months=lookback,
             history_months=args.history_months,
             min_history=args.min_history,
             min_confidence=args.min_confidence,

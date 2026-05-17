@@ -430,9 +430,9 @@ async def _run_job(
                 run_path=run_json_path,
                 output=sys.stdout,
             )
-            auto_applied = (summary or {}).get("auto_applied", 0)
+            auto_applied = (summary or {}).get("auto_applied", len((summary or {}).get("applied", [])))
             rules_created = (summary or {}).get("rules_created", 0)
-            needs_review = (summary or {}).get("needs_review", 0)
+            needs_review = (summary or {}).get("needs_review", (summary or {}).get("remaining_review_count", 0))
             parts: list[str] = []
             if auto_applied:
                 parts.append(f"{auto_applied} sorted")
@@ -601,8 +601,8 @@ def build_parser() -> argparse.ArgumentParser:
     run_job.add_argument("--month", help="Override reporting month (YYYY-MM)")
     run_job.add_argument("--lookback-months", type=int, default=3)
     run_job.add_argument("--history-months", type=int, default=12)
-    run_job.add_argument("--min-history", type=int, default=3)
-    run_job.add_argument("--min-confidence", type=float, default=0.8)
+    run_job.add_argument("--min-history", type=int, default=2)
+    run_job.add_argument("--min-confidence", type=float, default=0.7)
     run_job.add_argument("--refresh", action="store_true", help="Request an account refresh first")
     run_job.add_argument("--dry-run", action="store_true", help="Do not apply safe fixes")
     run_job.add_argument("--max-attempts", type=int, default=2)
